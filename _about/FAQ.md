@@ -25,6 +25,11 @@ For the `kubernetes_manifest` resource specifically, this resource _requires_ a 
 
 For this reason, the most reliable way to configure the Kubernetes provider is to ensure that the cluster itself and the Kubernetes provider resources can each be managed with separate apply operations. We recommend using the corresponding data sources to supply values to the provider block as needed.
 
+Two narrower workarounds also exist, for different variants of this problem:
+
+- If your Terraform version supports [deferred actions](https://developer.hashicorp.com/terraform/language/v1.9.x/upgrade-guides#deferred-changes-in-terraform-plans), the provider will defer planning `kubernetes_manifest` resources (and the `kubernetes`/`kubernetes-alpha` provider blocks) until the referenced cluster's attributes are known, rather than failing. See `_examples/deferred-actions` for a worked example.
+- If you need to apply a manifest to a cluster created earlier in the same apply, `kubernetes_manifest` (and the `kubernetes_resource`/`kubernetes_resources` data sources) accept an optional `bootstrap_connection` block supplying credentials for that cluster while the resource is being created, which no provider configuration can do. See the [`kubernetes_manifest` documentation](../docs/resources/manifest.md#bootstrapping-a-cluster-created-in-the-same-apply) for details. Unlike deferred actions, this doesn't require any particular Terraform version: when `bootstrap_connection` references a not-yet-known value, the provider reports `object` as "known after apply" instead of failing, and the re-plan Terraform performs during apply - once the credentials exist - does the cluster-dependent work. It only covers creation, though: reading, replacing and destroying the resource use its provider, so the resource still needs a provider configured for that cluster. The credential attributes are write-only and never reach state, which is what makes that split hold - and means a token from a short-lived data source leaves neither a permanent diff nor a secret at rest. Setting them requires Terraform 1.11 or later. Note this is *not* the way to manage resources across several clusters - declare one aliased `kubernetes` provider per cluster for that.
+
 ### How can I help?
 
 Check out the [Contributing Guide](CONTRIBUTING.md) for additional information.

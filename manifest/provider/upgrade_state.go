@@ -30,21 +30,16 @@ func (s *RawProviderServer) UpgradeResourceState(ctx context.Context, req *tfpro
 		return resp, nil
 	}
 
-	// test if credentials are valid - we're going to need them further down
-	// if no credentials found, just loop the current state back in
-	// we do this to work around https://github.com/hashicorp/terraform/issues/30460
-	cd := s.checkValidCredentials(ctx)
-	if len(cd) > 0 {
-		us, err := tfprotov5.NewDynamicValue(rt, rv)
-		if err != nil {
-			resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
-				Severity: tfprotov5.DiagnosticSeverityError,
-				Summary:  "Failed to encode new state during upgrade",
-				Detail:   err.Error(),
-			})
-		}
-		resp.UpgradedState = &us
-
+	// State written before the "bootstrap_connection" credentials became write-only, or by a
+	// Terraform that did not honour write-only, may still carry them. Strip them here so
+	// that an upgrade is also the point at which they stop being persisted.
+	rv, err = nullifyWriteOnlyConnection(rv)
+	if err != nil {
+		resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
+			Severity: tfprotov5.DiagnosticSeverityError,
+			Summary:  "Failed to remove write-only values from old state during upgrade",
+			Detail:   err.Error(),
+		})
 		return resp, nil
 	}
 
@@ -59,6 +54,40 @@ func (s *RawProviderServer) UpgradeResourceState(ctx context.Context, req *tfpro
 		return resp, nil
 	}
 
+	// test if credentials are valid - we're going to need them further down
+	// if no credentials found, just loop the current state back in
+	// we do this to work around https://github.com/hashicorp/terraform/issues/30460
+	// As with reading, a state upgrade uses the provider rather than the "bootstrap_connection"
+	// block recorded in state. See providerClients.
+	clients, clientDiags := s.providerClients(cs)
+	if len(clientDiags) > 0 {
+		us, err := tfprotov5.NewDynamicValue(rt, rv)
+		if err != nil {
+			resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
+				Severity: tfprotov5.DiagnosticSeverityError,
+				Summary:  "Failed to encode new state during upgrade",
+				Detail:   err.Error(),
+			})
+		}
+		resp.UpgradedState = &us
+
+		return resp, nil
+	}
+	cd := clients.CheckValidCredentials(ctx)
+	if len(cd) > 0 {
+		us, err := tfprotov5.NewDynamicValue(rt, rv)
+		if err != nil {
+			resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
+				Severity: tfprotov5.DiagnosticSeverityError,
+				Summary:  "Failed to encode new state during upgrade",
+				Detail:   err.Error(),
+			})
+		}
+		resp.UpgradedState = &us
+
+		return resp, nil
+	}
+
 	obj, ok := cs["object"]
 	if !ok {
 		resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
@@ -68,7 +97,7 @@ func (s *RawProviderServer) UpgradeResourceState(ctx context.Context, req *tfpro
 		return resp, nil
 	}
 
-	m, err := s.getRestMapper()
+	m, err := clients.RestMapper()
 	if err != nil {
 		resp.Diagnostics = append(resp.Diagnostics,
 			&tfprotov5.Diagnostic{
@@ -84,7 +113,7 @@ func (s *RawProviderServer) UpgradeResourceState(ctx context.Context, req *tfpro
 		return resp, fmt.Errorf("failed to determine resource GVK: %s", err)
 	}
 
-	tsch, _, err := s.TFTypeFromOpenAPI(ctx, gvk, false)
+	tsch, _, err := clients.TFTypeFromOpenAPI(ctx, gvk, false)
 	if err != nil {
 		return resp, fmt.Errorf("failed to determine resource type ID: %s", err)
 	}

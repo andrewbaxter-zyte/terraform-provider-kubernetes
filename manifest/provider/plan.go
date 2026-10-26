@@ -19,12 +19,12 @@ import (
 	"k8s.io/client-go/dynamic"
 )
 
-func (s *RawProviderServer) dryRun(ctx context.Context, obj tftypes.Value, fieldManager string, forceConflicts bool, isNamespaced bool) error {
-	c, err := s.getDynamicClient()
+func (rc *resourceClients) dryRun(ctx context.Context, obj tftypes.Value, fieldManager string, forceConflicts bool, isNamespaced bool) error {
+	c, err := rc.DynamicClient()
 	if err != nil {
 		return fmt.Errorf("failed to retrieve Kubernetes dynamic client during apply: %v", err)
 	}
-	m, err := s.getRestMapper()
+	m, err := rc.RestMapper()
 	if err != nil {
 		return fmt.Errorf("failed to retrieve Kubernetes RESTMapper client during apply: %v", err)
 	}
@@ -168,6 +168,10 @@ func (s *RawProviderServer) PlanResourceChange(ctx context.Context, req *tfproto
 		// if client supports it, request deferral when client configuration not fully known
 		proposedVal["object"] = tftypes.NewValue(tftypes.DynamicPseudoType, tftypes.UnknownValue)
 		newPlannedState := tftypes.NewValue(proposedState.Type(), proposedVal)
+		newPlannedState, err = nullifyWriteOnlyConnection(newPlannedState)
+		if err != nil {
+			return resp, err
+		}
 		ps, err := tfprotov5.NewDynamicValue(newPlannedState.Type(), newPlannedState)
 		if err != nil {
 			return resp, err
@@ -195,46 +199,6 @@ func (s *RawProviderServer) PlanResourceChange(ctx context.Context, req *tfproto
 	if len(execDiag) > 0 {
 		resp.Diagnostics = append(resp.Diagnostics, execDiag...)
 		return resp, nil
-	}
-
-	// test if credentials are valid - we're going to need them further down
-	resp.Diagnostics = append(resp.Diagnostics, s.checkValidCredentials(ctx)...)
-	if len(resp.Diagnostics) > 0 {
-		return resp, nil
-	}
-
-	computedFields := make(map[string]*tftypes.AttributePath)
-	var atp *tftypes.AttributePath
-	cfVal, ok := proposedVal["computed_fields"]
-	if ok && !cfVal.IsNull() && cfVal.IsKnown() {
-		var cf []tftypes.Value
-		cfVal.As(&cf)
-		for _, v := range cf {
-			var vs string
-			err := v.As(&vs)
-			if err != nil {
-				s.logger.Error("[computed_fields] cannot extract element from list")
-				continue
-			}
-			atp, err := FieldPathToTftypesPath(vs)
-			if err != nil {
-				s.logger.Error("[Configure]", "[computed_fields] cannot parse filed path element", err)
-				resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
-					Severity: tfprotov5.DiagnosticSeverityError,
-					Summary:  "[computed_fields] cannot parse field path element: " + vs,
-					Detail:   err.Error(),
-				})
-				continue
-			}
-			computedFields[atp.String()] = atp
-		}
-	} else {
-		// When not specified by the user, 'metadata.annotations' and 'metadata.labels' are configured as default
-		atp = tftypes.NewAttributePath().WithAttributeName("metadata").WithAttributeName("annotations")
-		computedFields[atp.String()] = atp
-
-		atp = tftypes.NewAttributePath().WithAttributeName("metadata").WithAttributeName("labels")
-		computedFields[atp.String()] = atp
 	}
 
 	// Decode prior resource state
@@ -274,6 +238,15 @@ func (s *RawProviderServer) PlanResourceChange(ctx context.Context, req *tfproto
 		return resp, nil
 	}
 
+	// Terraform Core always nulls write-only attributes (token, password, client_key,
+	// client_certificate, exec.env) in ProposedNewState - their real values only ever
+	// appear in Config. Swap in Config's "bootstrap_connection" before building a client
+	// from it, or every connection relying on one of those attributes would silently
+	// authenticate with no credentials at all.
+	if cfgVal, cfgErr := connectionFromConfig(req.Config, rt); cfgErr == nil {
+		proposedVal["bootstrap_connection"] = cfgVal
+	}
+
 	ppMan, ok := proposedVal["manifest"]
 	if !ok {
 		resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
@@ -285,7 +258,51 @@ func (s *RawProviderServer) PlanResourceChange(ctx context.Context, req *tfproto
 		return resp, nil
 	}
 
-	rm, err := s.getRestMapper()
+	clients, connectionUnknown, clientDiags := s.clientsFor(proposedVal)
+	if len(clientDiags) > 0 {
+		resp.Diagnostics = append(resp.Diagnostics, clientDiags...)
+		return resp, nil
+	}
+
+	if connectionUnknown {
+		// The "bootstrap_connection" block references values that won't be known until apply, so
+		// the cluster can't be reached to compute a plan. Leave "object" unknown and let
+		// the re-plan Terraform performs during apply - by which point the connection has
+		// resolved - compute it for real.
+		//
+		// This applies whether or not the resource already exists. Planning an update
+		// against the object shape recorded in prior state may look like it avoids a
+		// "known after apply" diff, but it makes morph.ValueToType below hard-fail as
+		// soon as the manifest gains a field the recorded shape doesn't have - precisely
+		// the case this feature exists to support. An unknown is always safe: it is
+		// what any other computed attribute would report, and it never constrains the
+		// value that apply is allowed to produce.
+		proposedVal["object"] = tftypes.NewValue(tftypes.DynamicPseudoType, tftypes.UnknownValue)
+		newPlannedState := tftypes.NewValue(proposedState.Type(), proposedVal)
+		newPlannedState, err = nullifyWriteOnlyConnection(newPlannedState)
+		if err != nil {
+			return resp, err
+		}
+		ps, err := tfprotov5.NewDynamicValue(newPlannedState.Type(), newPlannedState)
+		if err != nil {
+			return resp, err
+		}
+		resp.PlannedState = &ps
+		if canDeferr {
+			resp.Deferred = &tfprotov5.Deferred{
+				Reason: tfprotov5.DeferredReasonResourceConfigUnknown,
+			}
+		}
+		return resp, nil
+	}
+
+	// test if credentials are valid - we're going to need them further down
+	resp.Diagnostics = append(resp.Diagnostics, clients.CheckValidCredentials(ctx)...)
+	if len(resp.Diagnostics) > 0 {
+		return resp, nil
+	}
+
+	rm, err := clients.RestMapper()
 	if err != nil {
 		resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
 			Severity: tfprotov5.DiagnosticSeverityError,
@@ -312,7 +329,7 @@ func (s *RawProviderServer) PlanResourceChange(ctx context.Context, req *tfproto
 		return resp, nil
 	}
 
-	vdiags := s.validateResourceOnline(&ppMan)
+	vdiags := clients.validateResourceOnline(&ppMan)
 	if len(vdiags) > 0 {
 		resp.Diagnostics = append(resp.Diagnostics, vdiags...)
 		return resp, nil
@@ -334,7 +351,7 @@ func (s *RawProviderServer) PlanResourceChange(ctx context.Context, req *tfproto
 	}
 
 	// Request a complete type for the resource from the OpenAPI spec
-	objectType, hints, err := s.TFTypeFromOpenAPI(ctx, gvk, false)
+	objectType, hints, err := clients.TFTypeFromOpenAPI(ctx, gvk, false)
 	if err != nil {
 		return resp, fmt.Errorf("failed to determine resource type ID: %s", err)
 	}
@@ -360,7 +377,7 @@ func (s *RawProviderServer) PlanResourceChange(ctx context.Context, req *tfproto
 			return resp, nil
 		}
 
-		err = s.dryRun(ctx, ppMan, fieldManagerName, forceConflicts, ns)
+		err = clients.dryRun(ctx, ppMan, fieldManagerName, forceConflicts, ns)
 		if err != nil {
 			resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
 				Severity: tfprotov5.DiagnosticSeverityError,
@@ -376,8 +393,41 @@ func (s *RawProviderServer) PlanResourceChange(ctx context.Context, req *tfproto
 		}
 	}
 
-	so := objectType.(tftypes.Object)
-	s.logger.Debug("[PlanUpdateResource]", "OAPI type", dump(so))
+	computedFields := make(map[string]*tftypes.AttributePath)
+	var atp *tftypes.AttributePath
+	cfVal, ok := proposedVal["computed_fields"]
+	if ok && !cfVal.IsNull() && cfVal.IsKnown() {
+		var cf []tftypes.Value
+		cfVal.As(&cf)
+		for _, v := range cf {
+			var vs string
+			err := v.As(&vs)
+			if err != nil {
+				s.logger.Error("[computed_fields] cannot extract element from list")
+				continue
+			}
+			atp, err := FieldPathToTftypesPath(vs)
+			if err != nil {
+				s.logger.Error("[Configure]", "[computed_fields] cannot parse filed path element", err)
+				resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
+					Severity: tfprotov5.DiagnosticSeverityError,
+					Summary:  "[computed_fields] cannot parse field path element: " + vs,
+					Detail:   err.Error(),
+				})
+				continue
+			}
+			computedFields[atp.String()] = atp
+		}
+	} else {
+		// When not specified by the user, 'metadata.annotations' and 'metadata.labels' are configured as default
+		atp = tftypes.NewAttributePath().WithAttributeName("metadata").WithAttributeName("annotations")
+		computedFields[atp.String()] = atp
+
+		atp = tftypes.NewAttributePath().WithAttributeName("metadata").WithAttributeName("labels")
+		computedFields[atp.String()] = atp
+	}
+
+	s.logger.Debug("[PlanUpdateResource]", "OAPI type", dump(objectType))
 
 	// Transform the input manifest to adhere to the type model from the OpenAPI spec
 	morphedManifest, d := morph.ValueToType(ppMan, objectType, tftypes.NewAttributePath().WithAttributeName("object"))
@@ -515,6 +565,10 @@ func (s *RawProviderServer) PlanResourceChange(ctx context.Context, req *tfproto
 	}
 
 	propStateVal := tftypes.NewValue(proposedState.Type(), proposedVal)
+	propStateVal, err = nullifyWriteOnlyConnection(propStateVal)
+	if err != nil {
+		return resp, err
+	}
 	s.logger.Trace("[PlanResourceChange]", "new planned state", dump(propStateVal))
 
 	plannedState, err := tfprotov5.NewDynamicValue(propStateVal.Type(), propStateVal)

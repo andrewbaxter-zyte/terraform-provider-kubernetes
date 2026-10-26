@@ -134,7 +134,55 @@ func (s *RawProviderServer) ApplyResourceChange(ctx context.Context, req *tfprot
 		computedFields[atp.String()] = atp
 	}
 
-	c, err := s.getDynamicClient()
+	// A "bootstrap_connection" block supplies credentials only while the resource is being created
+	// or updated, where they come from freshly evaluated configuration. Deleting - whether
+	// a destroy or the delete half of a replacement - has no configuration to evaluate, so
+	// it uses the provider rather than the credentials recorded in state at the last
+	// apply, which may long since have expired. See providerClients.
+	var clients *resourceClients
+	var clientDiags []*tfprotov5.Diagnostic
+	// usedConnectionBlock records that this resource was created against a cluster named
+	// by a "bootstrap_connection" block rather than by the provider alone, which makes a "not found"
+	// on delete ambiguous - see where it is consumed below.
+	var usedConnectionBlock bool
+	if applyPlannedState.IsNull() {
+		priorConnVals := make(map[string]tftypes.Value)
+		if err := applyPriorState.As(&priorConnVals); err != nil {
+			resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
+				Severity: tfprotov5.DiagnosticSeverityError,
+				Summary:  "Failed to extract prior resource state values",
+				Detail:   err.Error(),
+			})
+			return resp, nil
+		}
+		usedConnectionBlock = hasConnectionBlock(priorConnVals)
+		clients, clientDiags = s.providerClients(priorConnVals)
+	} else {
+		// Terraform Core always nulls write-only attributes (token, password, client_key,
+		// client_certificate, exec.env) in PlannedState - their real values only ever
+		// appear in Config. Swap in Config's "bootstrap_connection" before building a
+		// client from it, or a connection relying on one of those attributes would
+		// silently authenticate with no credentials at all.
+		if cv, ok := confVals["bootstrap_connection"]; ok {
+			plannedStateVal["bootstrap_connection"] = cv
+		}
+		var connectionUnknown bool
+		clients, connectionUnknown, clientDiags = s.clientsFor(plannedStateVal)
+		if connectionUnknown {
+			resp.Diagnostics = append(resp.Diagnostics, &tfprotov5.Diagnostic{
+				Severity: tfprotov5.DiagnosticSeverityError,
+				Summary:  `"bootstrap_connection" block contains values that are not yet known`,
+				Detail:   "This should not happen at apply time. If this error is reproducible, please report this issue to the provider maintainers.",
+			})
+			return resp, nil
+		}
+	}
+	if len(clientDiags) > 0 {
+		resp.Diagnostics = append(resp.Diagnostics, clientDiags...)
+		return resp, nil
+	}
+
+	c, err := clients.DynamicClient()
 	if err != nil {
 		resp.Diagnostics = append(resp.Diagnostics,
 			&tfprotov5.Diagnostic{
@@ -144,7 +192,7 @@ func (s *RawProviderServer) ApplyResourceChange(ctx context.Context, req *tfprot
 			})
 		return resp, nil
 	}
-	m, err := s.getRestMapper()
+	m, err := clients.RestMapper()
 	if err != nil {
 		resp.Diagnostics = append(resp.Diagnostics,
 			&tfprotov5.Diagnostic{
@@ -178,7 +226,7 @@ func (s *RawProviderServer) ApplyResourceChange(ctx context.Context, req *tfprot
 			return resp, nil
 		}
 
-		tsch, th, err := s.TFTypeFromOpenAPI(ctx, gvk, false)
+		tsch, th, err := clients.TFTypeFromOpenAPI(ctx, gvk, false)
 		if err != nil {
 			return resp, fmt.Errorf("failed to determine resource type ID: %s", err)
 		}
@@ -406,7 +454,7 @@ func (s *RawProviderServer) ApplyResourceChange(ctx context.Context, req *tfprot
 			return resp, nil
 		}
 
-		wt, _, err := s.TFTypeFromOpenAPI(ctx, gvk, true)
+		wt, _, err := clients.TFTypeFromOpenAPI(ctx, gvk, true)
 		if err != nil {
 			return resp, fmt.Errorf("failed to determine resource type ID: %s", err)
 		}
@@ -477,6 +525,10 @@ func (s *RawProviderServer) ApplyResourceChange(ctx context.Context, req *tfprot
 		plannedStateVal["object"] = morph.UnknownToNull(compObj)
 
 		newStateVal := tftypes.NewValue(applyPlannedState.Type(), plannedStateVal)
+		newStateVal, err = nullifyWriteOnlyConnection(newStateVal)
+		if err != nil {
+			return resp, err
+		}
 		s.logger.Trace("[ApplyResourceChange][Apply]", "new state value", dump(newStateVal))
 
 		newResState, err := tfprotov5.NewDynamicValue(newStateVal.Type(), newStateVal)
@@ -551,6 +603,27 @@ func (s *RawProviderServer) ApplyResourceChange(ctx context.Context, req *tfprot
 
 		err = rs.Delete(ctxDeadline, rname, metav1.DeleteOptions{})
 		if err != nil {
+			if apierrors.IsNotFound(err) && usedConnectionBlock {
+				// The resource was created against a cluster named by its "bootstrap_connection"
+				// block, but the delete runs against the provider's cluster. "Not found"
+				// is therefore ambiguous: the object may genuinely be gone, or the
+				// provider may be pointed at a different cluster than the one holding
+				// it. Dropping it from state on that evidence would silently orphan it,
+				// so refuse and let the operator decide.
+				resp.Diagnostics = append(resp.Diagnostics,
+					&tfprotov5.Diagnostic{
+						Severity: tfprotov5.DiagnosticSeverityError,
+						Summary:  fmt.Sprintf("Resource %q was not found in the cluster it was deleted from", rname),
+						Detail: fmt.Sprintf("The resource %q was not found in the Kubernetes API, and this resource has a "+
+							"\"bootstrap_connection\" block, so it may have been created against a different cluster than the "+
+							"provider is currently configured for.\n\n"+
+							"Terraform has not removed it from state, because doing so would leave the object behind "+
+							"if it still exists elsewhere. Check that the provider this resource is associated with "+
+							"points at the cluster holding it. If the object is genuinely gone, remove it from state "+
+							"with \"terraform state rm\".", rname),
+					})
+				return resp, nil
+			}
 			if apierrors.IsNotFound(err) {
 				s.logger.Trace("[ApplyResourceChange][Delete]", "Resource is already deleted")
 

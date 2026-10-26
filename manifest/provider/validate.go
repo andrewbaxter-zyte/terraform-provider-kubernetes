@@ -160,11 +160,42 @@ func (s *RawProviderServer) ValidateResourceTypeConfig(ctx context.Context, req 
 		})
 	}
 
+	resp.Diagnostics = append(resp.Diagnostics, validateWriteOnlySupport(configVal, req.ClientCapabilities)...)
+
 	return resp, nil
 }
 
-func (s *RawProviderServer) validateResourceOnline(manifest *tftypes.Value) (diags []*tfprotov5.Diagnostic) {
-	rm, err := s.getRestMapper()
+// validateWriteOnlySupport rejects a "bootstrap_connection" block that sets credentials when the
+// Terraform running the provider cannot handle write-only attributes.
+//
+// The credential attributes are write-only so that they are never persisted to state.
+// Terraform only honours that from 1.11 onwards; an older version would store them, and
+// would reject the plan as inconsistent when the provider nulled them. Rather than keep a
+// second code path for that, the block requires a Terraform that supports it, and says so
+// here instead of letting Core report a confusing consistency error later.
+func validateWriteOnlySupport(configVal map[string]tftypes.Value, caps *tfprotov5.ValidateResourceTypeConfigClientCapabilities) (diags []*tfprotov5.Diagnostic) {
+	if caps != nil && caps.WriteOnlyAttributesAllowed {
+		return nil
+	}
+	set := writeOnlyConnectionAttributesSet(configVal)
+	if len(set) == 0 {
+		return nil
+	}
+	return []*tfprotov5.Diagnostic{{
+		Severity:  tfprotov5.DiagnosticSeverityError,
+		Summary:   `"bootstrap_connection" credentials require Terraform 1.11 or later`,
+		Attribute: tftypes.NewAttributePath().WithAttributeName("bootstrap_connection"),
+		Detail: fmt.Sprintf("This resource sets %s in its \"bootstrap_connection\" block. These are write-only "+
+			"attributes, so that credentials for the target cluster are never written to Terraform state, "+
+			"and write-only attributes require Terraform 1.11 or later.\n\n"+
+			"Either upgrade Terraform, or remove the \"bootstrap_connection\" block and configure a provider for the "+
+			"target cluster instead - which requires that the cluster already exists when Terraform starts.",
+			strings.Join(set, ", ")),
+	}}
+}
+
+func (rc *resourceClients) validateResourceOnline(manifest *tftypes.Value) (diags []*tfprotov5.Diagnostic) {
+	rm, err := rc.RestMapper()
 	if err != nil {
 		diags = append(diags, &tfprotov5.Diagnostic{
 			Severity: tfprotov5.DiagnosticSeverityError,

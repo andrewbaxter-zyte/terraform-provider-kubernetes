@@ -9,6 +9,8 @@ description: |-
 
 This data source is a generic way to retrieve resources from the Kubernetes API.
 
+The optional `bootstrap_connection` block supplies credentials for a cluster created earlier in the same apply, which the provider block cannot be configured against. For managing resources across several clusters generally, use an aliased provider instead. See [Bootstrapping a cluster created in the same apply](../resources/manifest.md#bootstrapping-a-cluster-created-in-the-same-apply) for details.
+
 {{ .SchemaMarkdown }}
 
 ### Example: Get data from a ConfigMap

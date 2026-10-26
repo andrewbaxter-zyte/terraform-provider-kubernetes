@@ -23,11 +23,48 @@ Once applied, the `object` attribute contains the state of the resource as retur
 ### Optional
 
 - `computed_fields` (List of String) List of manifest fields whose values can be altered by the API server during 'apply'. Defaults to: ["metadata.annotations", "metadata.labels"]
+- `bootstrap_connection` (Block List, Max: 1) Connection settings used while this resource is being created, for a cluster that does not exist yet when the provider is configured and so cannot be reached by any provider configuration during that apply. Reading, replacing and destroying the resource use its provider instead, so the resource still needs a provider configured for the same cluster - to manage resources across several clusters, use aliased provider configurations rather than this block. Not merged with the provider block, and unlike the provider block it does not fall back to KUBE_* environment variables. The credential attributes are write-only: they are never persisted to state, so Terraform 1.11 or later is required to set them. (see [below for nested schema](#nestedblock--bootstrap_connection))
 - `field_manager` (Block List, Max: 1) Configure field manager options. (see [below for nested schema](#nestedblock--field_manager))
 - `object` (Dynamic) The resulting resource state, as returned by the API server after applying the desired state from `manifest`.
 - `timeouts` (Block List, Max: 1) (see [below for nested schema](#nestedblock--timeouts))
 - `wait` (Block List, Max: 1) Configure waiter options. (see [below for nested schema](#nestedblock--wait))
 - `wait_for` (Object, Deprecated) A map of attribute paths and desired patterns to be matched. After each apply the provider will wait for all attributes listed here to reach a value that matches the desired pattern. (see [below for nested schema](#nestedatt--wait_for))
+
+<a id="nestedblock--bootstrap_connection"></a>
+### Nested Schema for `bootstrap_connection`
+
+Optional:
+
+- `client_certificate` (String, Write-only, Sensitive) PEM-encoded client certificate for TLS authentication.
+- `client_key` (String, Write-only, Sensitive) PEM-encoded client certificate key for TLS authentication.
+- `cluster_ca_certificate` (String) PEM-encoded root certificates bundle for TLS authentication.
+- `config_context` (String) Context to choose from the config file.
+- `config_context_auth_info` (String) Authentication info context of the kube config (name of the kubeconfig user, `--user` flag in `kubectl`).
+- `config_context_cluster` (String) Cluster context of the kube config (name of the kubeconfig cluster, `--cluster` flag in `kubectl`).
+- `config_path` (String) A path to a kube config file.
+- `config_paths` (List of String) A list of paths to the kube config files.
+- `exec` (Block List, Max: 1) Configuration block to use an exec-based credential plugin, e.g. call an external command to receive user credentials. (see [below for nested schema](#nestedblock--bootstrap_connection--exec))
+- `host` (String) The hostname (in form of URI) of the Kubernetes API.
+- `insecure` (Boolean) Whether the server should be accessed without verifying the TLS certificate. Defaults to `false`.
+- `password` (String, Write-only, Sensitive) The password to use for HTTP basic authentication when accessing the Kubernetes API.
+- `proxy_url` (String) URL to the proxy to be used for all API requests. URLs with "http", "https", and "socks5" schemes are supported.
+- `tls_server_name` (String) Server name passed to the server for SNI and is used in the client to check server certificates against.
+- `token` (String, Write-only, Sensitive) Token of your service account.
+- `username` (String) The username to use for HTTP basic authentication when accessing the Kubernetes API.
+
+<a id="nestedblock--bootstrap_connection--exec"></a>
+### Nested Schema for `bootstrap_connection.exec`
+
+Required:
+
+- `api_version` (String) API version to use when decoding the ExecCredentials resource, e.g. `client.authentication.k8s.io/v1`.
+- `command` (String) Command to execute.
+
+Optional:
+
+- `args` (List of String) List of arguments to pass when executing the plugin.
+- `env` (Map of String, Write-only, Sensitive) Map of environment variables to set when executing the plugin.
+
 
 <a id="nestedblock--field_manager"></a>
 ### Nested Schema for `field_manager`
@@ -79,7 +116,7 @@ Optional:
 
 ### Before you use this resource
 
-- This resource requires API access during planning time. This means the cluster has to be accessible at plan time and thus cannot be created in the same apply operation. We recommend only using this resource for custom resources or resources not yet fully supported by the provider.
+- This resource requires API access during planning time. This means the cluster has to be accessible at plan time and thus cannot be created in the same apply operation using the provider block's bootstrap_connection settings alone. The `bootstrap_connection` block (see below) covers that one case, supplying credentials for a cluster created earlier in the same apply while the resource is being created. We recommend only using this resource for custom resources or resources not yet fully supported by the provider.
 
 - This resource uses [Server-side Apply](https://kubernetes.io/docs/reference/using-api/server-side-apply/) to carry out apply operations. A minimum Kubernetes version of 1.16.x is required, but versions 1.17+ are strongly recommended as the SSA implementation in Kubernetes 1.16.x is incomplete and unstable.
 
@@ -252,6 +289,89 @@ resource "kubernetes_manifest" "test" {
   }
 }
 ```
+
+## Bootstrapping a cluster created in the same apply
+
+The `bootstrap_connection` block supplies bootstrap_connection settings for a single `kubernetes_manifest` resource (or `kubernetes_resource`/`kubernetes_resources` data source) **while that resource is being created**, for the one case the provider block cannot handle: a cluster that does not exist yet when the provider is configured.
+
+-> If you simply need to manage resources across several clusters, you do not want this block. Declare one `provider "kubernetes"` configuration per cluster using [`alias`](https://developer.hashicorp.com/terraform/language/providers/configuration#alias-multiple-provider-configurations), and select one per resource with the `provider` meta-argument. Aliased providers participate in the dependency graph, are reusable across resources, and are re-evaluated on every run. `bootstrap_connection` does none of those things and exists only to cover the bootstrap gap described below.
+
+Provider blocks are evaluated before any resource is created, so a provider cannot depend on the output of a resource in the same configuration. That makes a cluster created in the current apply unreachable by any provider configuration during that apply. The `bootstrap_connection` block closes exactly that gap, and nothing wider:
+
+```terraform
+# Covers the run that creates the cluster.
+resource "kubernetes_manifest" "test-configmap" {
+  provider = kubernetes.workload
+
+  manifest = {
+    "apiVersion" = "v1"
+    "kind"       = "ConfigMap"
+    "metadata" = {
+      "name"      = "test-config"
+      "namespace" = "default"
+    }
+    "data" = {
+      "foo" = "bar"
+    }
+  }
+
+  bootstrap_connection {
+    host                   = some_cluster_resource.example.endpoint
+    cluster_ca_certificate = some_cluster_resource.example.ca_certificate
+    token                  = some_cluster_resource.example.token
+  }
+}
+
+# Covers every run after that. Data sources are re-read on each run, so this
+# provider always authenticates with current credentials.
+provider "kubernetes" {
+  alias                  = "workload"
+  host                   = data.some_cluster.example.endpoint
+  cluster_ca_certificate = data.some_cluster.example.ca_certificate
+  token                  = data.some_cluster_auth.example.token
+}
+```
+
+### Which bootstrap_connection each operation uses
+
+| Operation | Uses |
+|---|---|
+| Plan, create, update | The `bootstrap_connection` block, from configuration |
+| Read / refresh | The resource's provider |
+| Delete - destroy, or the delete half of a replacement | The resource's provider |
+| State upgrade | The resource's provider |
+
+Creating and updating evaluate configuration, so `bootstrap_connection` is current at the moment it is used. Deleting does not: Terraform supplies no configuration for a delete. Since the credentials are write-only and therefore never recorded (see below), there is nothing in state for a delete to fall back on - which is the intended outcome, because anything recorded at the last apply would by then be expired. For the short-lived tokens Kubernetes platforms issue - an EKS token lasts about fifteen minutes - a stored credential is useless within the hour. Deletes therefore authenticate with the resource's provider configuration, which is evaluated afresh on every run.
+
+This is why the example above declares an aliased provider as well as a `bootstrap_connection` block. **A resource with a `bootstrap_connection` block and no usable provider configuration can be created but not subsequently read, replaced or destroyed**, and the provider will tell you so rather than attempt it.
+
+~> Because a delete authenticates against the provider's cluster rather than the one named by `bootstrap_connection`, a "not found" response during delete is ambiguous - the object may be gone, or the provider may point somewhere else. For resources carrying a `bootstrap_connection` block the provider treats this as an error and leaves the resource in state, rather than dropping it and potentially orphaning a live object. If the object is genuinely gone, remove it with `terraform state rm`.
+
+### Environment variables
+
+Unlike the provider block, a `bootstrap_connection` block does **not** fall back to `KUBE_*` environment variables for attributes you leave unset - so a `KUBE_CONFIG_PATH` or `KUBE_TOKEN` exported in the shell running Terraform cannot silently redirect the resource at whatever cluster the operator happens to be pointed at. A `bootstrap_connection` block must describe its target cluster in full; if it doesn't resolve to a usable configuration, the provider reports an error rather than guessing.
+
+### Credentials are never written to state
+
+The credential attributes - `token`, `password`, `client_key`, `client_certificate` and `exec.env` - are [write-only](https://developer.hashicorp.com/terraform/language/resources/ephemeral/write-only). Terraform sends their values to the provider when it needs them and never records them in the plan or in state.
+
+This is what makes the bootstrap-only model above hold rather than merely being a convention. There is no recorded copy of a credential for a later operation to authenticate with, so a destroy or a replacement *cannot* reach for a token captured at the last apply; the provider's configuration is the only thing available, and it is evaluated afresh on every run.
+
+It also means the usual reason not to put a data-source credential in a resource argument does not apply here. Sourcing `bootstrap_connection.token` from something that mints a fresh credential on every read - `aws_eks_cluster_auth` and its equivalents - is the expected usage: because the value is write-only, the rotation is invisible to the plan, so it produces neither a permanent diff nor a secret at rest in the state file.
+
+~> Write-only attributes require **Terraform 1.11 or later**. Setting any credential in a `bootstrap_connection` block on an earlier version is an error; the rest of the provider is unaffected and keeps its existing minimum of 0.14.8. If you cannot upgrade, the alternative is to drop the `bootstrap_connection` block and configure a provider for the cluster, which requires that the cluster already exists when Terraform starts.
+
+### Planning when the bootstrap_connection isn't known yet
+
+If `bootstrap_connection`'s values reference an attribute of a resource that hasn't been created yet (as in the example above, before `some_cluster_resource.example` exists), the provider can't reach the cluster to compute a plan the normal way. Rather than failing, it reports `object` as unknown - "known after apply" - exactly as any other computed attribute would, and skips the validation and dry-run steps that would need the cluster.
+
+Terraform re-plans every resource during apply, by which point the `bootstrap_connection` values have been resolved. That second plan is the one that reaches the cluster, determines the resource's real schema, and produces the final `object`. So the cluster-dependent work still happens on every apply - it just happens once the credentials exist.
+
+This applies whether or not the resource already exists in state. Planning an update against the object shape recorded by the last apply might look like it would avoid the "known after apply" diff, but it fails as soon as the manifest gains a field that the recorded shape doesn't have - which is a common thing to do in the same change that creates the cluster. An unknown is always safe, and never constrains what apply is allowed to produce.
+
+This behaviour works regardless of Terraform version - it doesn't require [deferred actions](https://developer.hashicorp.com/terraform/language/v1.9.x/upgrade-guides#deferred-changes-in-terraform-plans) support, though the provider will use that mechanism to show the pending dependency explicitly in the plan output when it's available.
+
+~> A `bootstrap_connection` block and the provider the resource is associated with must describe the **same** cluster. `bootstrap_connection` supplies bootstrap credentials for that cluster during the run that creates the resource; it is not a way to send an individual resource to a different cluster than its provider. Pointing the two at different clusters means the resource is created in one and read, replaced and destroyed in another. Use a separate aliased provider instead.
 
 ## Computed fields
 
